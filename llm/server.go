@@ -87,9 +87,55 @@ func LoadModel(model string, maxArraySize int) (*ggml.GGML, error) {
 	return ggml, err
 }
 
-// NewLlamaServer will run a server for the given GPUs
-// The gpu list must be a single family.
 func NewLlamaServer(gpus discover.GpuInfoList, model string, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int) (LlamaServer, error) {
+    slog.Info("Initializing Llama server...")
+
+    // Validate model path
+    if _, err := os.Stat(model); err != nil {
+        return nil, fmt.Errorf("model path does not exist: %w", err)
+    }
+
+    // Check GPU configuration
+    if len(gpus) == 0 {
+        return nil, fmt.Errorf("no GPUs available for Llama server")
+    }
+
+    slog.Info("System information and GPU configuration validated.")
+    
+    // Proceed with server initialization
+    slog.Info("Starting Llama server with the following parameters:", "model", model, "numParallel", numParallel)
+    
+    // Existing code...
+    
+    // If the user wants zero GPU layers, reset the gpu list to be CPU/system ram info
+    if opts.NumGPU == 0 {
+        gpus = discover.GetCPUInfo()
+    }
+
+    // Existing code...
+
+    // On linux and windows, over-allocating CPU memory will almost always result in an error
+    // Darwin has fully dynamic swap so has no direct concept of free swap space
+    if runtime.GOOS != "darwin" {
+        systemMemoryRequired := estimate.TotalSize - estimate.VRAMSize
+        available := systemFreeMemory + systemSwapFreeMemory
+        if systemMemoryRequired > available {
+            return nil, fmt.Errorf("model requires more system memory (%s) than is available (%s)", format.HumanBytes2(systemMemoryRequired), format.HumanBytes2(available))
+        }
+    }
+
+    // Existing code...
+
+    // Start the server
+    slog.Info("Starting Llama server...")
+    if err = s.cmd.Start(); err != nil {
+        return nil, fmt.Errorf("error starting Llama server: %w", err)
+    }
+
+    // Existing code...
+    
+    return s, nil
+}
 	systemInfo := discover.GetSystemInfo()
 	systemTotalMemory := systemInfo.System.TotalMemory
 	systemFreeMemory := systemInfo.System.FreeMemory
@@ -697,7 +743,6 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 		"seed":              req.Options.Seed,
 		"stop":              req.Options.Stop,
 		"image_data":        req.Images,
-		"cache_prompt":      true,
 	}
 
 	if len(req.Format) > 0 {

@@ -53,9 +53,13 @@ import (
 	"github.com/ollama/ollama/ml/backend/ggml/ggml/src"
 )
 
-func BackendInit() {
+func BackendInit() error {
 	ggml.OnceLoad()
-	C.llama_backend_init()
+	result := C.llama_backend_init()
+	if result != 0 {
+		return fmt.Errorf("failed to initialize LLAMA backend, error code: %d", result)
+	}
+	return nil
 }
 
 func PrintSystemInfo() string {
