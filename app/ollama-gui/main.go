@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"time"
+
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
@@ -110,7 +112,7 @@ func (a *App) ensureOllamaIsRunning() {
 		
 		// Run the process in the background
 		err := a.serverProcess.Start()
-		if err != nil {
+		if (err != nil) {
 			log.Printf("Failed to start Ollama server: %v", err)
 			return
 		}
