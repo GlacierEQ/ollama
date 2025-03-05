@@ -33,7 +33,9 @@ func New(c ml.Config) (model.Model, error) {
 				Types:  c.Uints("tokenizer.ggml.token_type"),
 				Merges: c.Strings("tokenizer.ggml.merges"),
 				BOS:    int32(c.Uint("tokenizer.ggml.bos_token_id")),
+				AddBOS: c.Bool("tokenizer.ggml.add_bos_token", true),
 				EOS:    int32(c.Uint("tokenizer.ggml.eos_token_id")),
+				AddEOS: c.Bool("tokenizer.ggml.add_eos_token", false),
 			},
 		),
 		ImageProcessor: newImageProcessor(c),
@@ -41,7 +43,9 @@ func New(c ml.Config) (model.Model, error) {
 		TextModel:      newTextModel(c),
 	}
 
-	m.Cache = kvcache.NewWrapperCache(kvcache.NewEncoderCache(), kvcache.NewCausalCache(m.TextModel.Shift))
+	encoderCache := kvcache.NewEncoderCache()
+	encoderCache.SetConfig(ml.CacheConfig{})
+	m.Cache = kvcache.NewWrapperCache(encoderCache, kvcache.NewCausalCache(m.TextModel.Shift))
 
 	return &m, nil
 }
