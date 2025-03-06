@@ -33,6 +33,9 @@ COMPILER inline get_compiler() {
 #endif
 }
 
+// Add GPU memory detection
+extern int get_gpu_memory_info(int device_id, size_t* free_memory, size_t* total_memory);
+
 */
 import "C"
 
@@ -55,11 +58,15 @@ import (
 	ggml "github.com/ollama/ollama/ml/backend/ggml/ggml/src"
 )
 
-<<<<<<< HEAD
 func BackendInit() error {
-=======
-func init() {
+	ggml.OnceLoad()
+	result := C.llama_backend_init()
+	if result != 0 {
+		return fmt.Errorf("failed to initialize LLAMA backend, error code: %d", result)
+	}
+	
 	C.llama_log_set(C.ggml_log_callback(C.llamaLog), nil)
+	return nil
 }
 
 //export llamaLog
@@ -68,16 +75,6 @@ func llamaLog(level C.int, text *C.char, _ unsafe.Pointer) {
 	if slog.Default().Enabled(context.TODO(), slog.Level(int(level-C.GGML_LOG_LEVEL_INFO)*4)) {
 		fmt.Fprint(os.Stderr, C.GoString(text))
 	}
-}
-
-func BackendInit() {
->>>>>>> 7a01ad76143973199bd6965c13476d2d04f10f75
-	ggml.OnceLoad()
-	result := C.llama_backend_init()
-	if result != 0 {
-		return fmt.Errorf("failed to initialize LLAMA backend, error code: %d", result)
-	}
-	return nil
 }
 
 func PrintSystemInfo() string {
@@ -230,6 +227,7 @@ type ModelParams struct {
 	TensorSplit  []float32
 	Progress     func(float32)
 	VocabOnly    bool
+	AutoConfig   bool // New parameter to enable auto-configuration
 }
 
 //export llamaProgressCallback
@@ -240,7 +238,99 @@ func llamaProgressCallback(progress C.float, userData unsafe.Pointer) C.bool {
 	return true
 }
 
+// SystemCapabilities represents the detected hardware capabilities
+type SystemCapabilities struct {
+	TotalGPUMemory     int64
+	FreeGPUMemory      int64
+	NumCPUCores        int
+	TotalSystemMemory  int64
+	AvailableSystemMem int64
+	GPUDeviceCount     int
+	CUDAAvailable      bool
+}
+
+// GetSystemCapabilities detects and returns information about system hardware
+func GetSystemCapabilities() SystemCapabilities {
+	caps := SystemCapabilities{
+		NumCPUCores: runtime.NumCPU(),
+	}
+	
+	// Get GPU info if available
+	var freeMemory, totalMemory C.size_t
+	for deviceID := 0; deviceID < 8; deviceID++ { // Check up to 8 GPUs
+		result := int(C.get_gpu_memory_info(C.int(deviceID), &freeMemory, &totalMemory))
+		if result == 0 { // Success
+			caps.GPUDeviceCount++
+			caps.CUDAAvailable = true
+			caps.TotalGPUMemory += int64(totalMemory)
+			caps.FreeGPUMemory += int64(freeMemory)
+		} else if result == -3 {
+			// No CUDA support, don't keep trying more devices
+			break
+		} else if result < 0 {
+			// Error with this device, try next one
+			continue
+		}
+	}
+	
+	// If we couldn't detect GPU properly, try to determine if NVIDIA is present
+	// through other means
+	if !caps.CUDAAvailable {
+		// Try to detect NVIDIA GPUs through other means
+		// This is just a placeholder - actual implementation would depend on the platform
+		caps.CUDAAvailable = false
+	}
+	
+	return caps
+}
+
+// OptimizeModelParams automatically configures model parameters based on hardware
+func OptimizeModelParams(params *ModelParams) {
+	caps := GetSystemCapabilities()
+	
+	// Logic to determine optimal parameters based on hardware
+	if caps.CUDAAvailable && caps.FreeGPUMemory > 2*1024*1024*1024 { // If >2GB free VRAM
+		// Determine optimal GPU layer distribution
+		if caps.GPUDeviceCount > 1 {
+			// Create optimal tensor split based on available memory on each GPU
+			params.TensorSplit = make([]float32, caps.GPUDeviceCount)
+			totalMem := float32(0)
+			
+			var deviceMemory []float32
+			for i := 0; i < caps.GPUDeviceCount; i++ {
+				var free, total C.size_t
+				C.get_gpu_memory_info(C.int(i), &free, &total)
+				deviceMemory = append(deviceMemory, float32(free))
+				totalMem += float32(free)
+			}
+			
+			// Calculate tensor split proportions
+			for i := 0; i < caps.GPUDeviceCount; i++ {
+				params.TensorSplit[i] = deviceMemory[i] / totalMem
+			}
+		}
+		
+		// Set all layers to GPU if enough VRAM
+		params.NumGpuLayers = 100 // Use 100 as a value meaning "all layers"
+		params.MainGpu = 0
+	} else {
+		// Limited or no GPU - optimize for CPU
+		params.NumGpuLayers = 0
+		params.UseMmap = true
+		
+		// Optimize thread count based on CPU cores
+		if caps.NumCPUCores > 4 {
+			runtime.GOMAXPROCS(caps.NumCPUCores - 1) // Leave one core for system
+		}
+	}
+}
+
 func LoadModelFromFile(modelPath string, params ModelParams) (*Model, error) {
+	// Apply automatic configuration if requested
+	if params.AutoConfig {
+		OptimizeModelParams(&params)
+	}
+	
 	cparams := C.llama_model_default_params()
 	cparams.n_gpu_layers = C.int(params.NumGpuLayers)
 	cparams.main_gpu = C.int32_t(params.MainGpu)
