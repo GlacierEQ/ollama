@@ -33,9 +33,6 @@ COMPILER inline get_compiler() {
 #endif
 }
 
-// Add GPU memory detection
-extern int get_gpu_memory_info(int device_id, size_t* free_memory, size_t* total_memory);
-
 */
 import "C"
 
@@ -75,6 +72,11 @@ func llamaLog(level C.int, text *C.char, _ unsafe.Pointer) {
 	if slog.Default().Enabled(context.TODO(), slog.Level(int(level-C.GGML_LOG_LEVEL_INFO)*4)) {
 		fmt.Fprint(os.Stderr, C.GoString(text))
 	}
+}
+
+func BackendInit() {
+	ggml.OnceLoad()
+	C.llama_backend_init()
 }
 
 func PrintSystemInfo() string {
