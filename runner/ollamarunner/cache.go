@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"reflect"
 	"time"
 
 	"github.com/ollama/ollama/kvcache"
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/model"
+	"github.com/ollama/ollama/model/input"
 )
 
 type InputCache struct {
@@ -31,27 +31,26 @@ type InputCache struct {
 	cache kvcache.Cache
 }
 
-func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots int, multiUserCache bool) (*InputCache, error) {
-	if kvSize/int32(numSlots) < 1 {
+func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots int, batchSize int, multiUserCache bool) (*InputCache, error) {
+	numCtx := kvSize / int32(numSlots)
+
+	if numCtx < 1 {
 		return nil, fmt.Errorf("must have at least one kv cache entry per parallel sequence (kv: %v parallel: %v)", kvSize, numSlots)
 	}
 
 	slots := make([]InputCacheSlot, numSlots)
 
 	for i := range slots {
-		slots[i] = InputCacheSlot{
-			Id:     i,
-			Inputs: make([]input, 0),
-		}
+		slots[i] = InputCacheSlot{Id: i}
 	}
 
 	cache := model.Config().Cache
 	if cache != nil {
-		cache.Init(model.Backend(), kvCacheTypeFromStr(kvCacheType), kvSize)
+		cache.Init(model.Backend(), kvCacheTypeFromStr(kvCacheType), numSlots, int(numCtx), batchSize)
 	}
 
 	return &InputCache{
-		numCtx:         kvSize / int32(numSlots),
+		numCtx:         numCtx,
 		enabled:        cache != nil,
 		slots:          slots,
 		multiUserCache: multiUserCache,
@@ -62,9 +61,9 @@ func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots
 func kvCacheTypeFromStr(s string) ml.DType {
 	switch s {
 	case "q8_0":
-		panic("kv cache quantization not yet implemented")
+		return ml.DTypeQ80
 	case "q4_0":
-		panic("kv cache quantization not yet implemented")
+		return ml.DTypeQ40
 	default:
 		return ml.DTypeF16
 	}
@@ -83,7 +82,7 @@ type InputCacheSlot struct {
 	Id int
 
 	// Inputs that are stored in the KV cache
-	Inputs []input
+	Inputs []input.Input
 
 	// is this cache actively being processed as part of a sequence?
 	InUse bool
@@ -92,7 +91,7 @@ type InputCacheSlot struct {
 	lastUsed time.Time
 }
 
-func (c *InputCache) LoadCacheSlot(prompt []input, cachePrompt bool) (*InputCacheSlot, []input, error) {
+func (c *InputCache) LoadCacheSlot(prompt []input.Input) (*InputCacheSlot, []input.Input, error) {
 	var slot *InputCacheSlot
 	var numPast int32
 	var err error
@@ -108,10 +107,6 @@ func (c *InputCache) LoadCacheSlot(prompt []input, cachePrompt bool) (*InputCach
 	}
 	if err != nil {
 		return nil, nil, err
-	}
-
-	if !cachePrompt {
-		numPast = 0
 	}
 
 	slot.InUse = true
@@ -143,7 +138,7 @@ func (c *InputCache) LoadCacheSlot(prompt []input, cachePrompt bool) (*InputCach
 	return slot, prompt, nil
 }
 
-func (c *InputCache) findLongestCacheSlot(prompt []input) (*InputCacheSlot, int32, error) {
+func (c *InputCache) findLongestCacheSlot(prompt []input.Input) (*InputCacheSlot, int32, error) {
 	longest := int32(-1)
 	var longestSlot *InputCacheSlot
 
@@ -166,7 +161,7 @@ func (c *InputCache) findLongestCacheSlot(prompt []input) (*InputCacheSlot, int3
 	return longestSlot, longest, nil
 }
 
-func (c *InputCache) findBestCacheSlot(prompt []input) (*InputCacheSlot, int32, error) {
+func (c *InputCache) findBestCacheSlot(prompt []input.Input) (*InputCacheSlot, int32, error) {
 	oldest := time.Now()
 	var oldestSlot *InputCacheSlot
 
@@ -202,7 +197,7 @@ func (c *InputCache) findBestCacheSlot(prompt []input) (*InputCacheSlot, int32, 
 	if longest > 0 && longestSlot != oldestSlot {
 		slog.Debug("forking cache slot", "src", longestSlot.Id, "dst", oldestSlot.Id, "inputs", longest, "total",
 			len(longestSlot.Inputs))
-		oldestSlot.Inputs = make([]input, longest)
+		oldestSlot.Inputs = make([]input.Input, longest)
 		copy(oldestSlot.Inputs, longestSlot.Inputs[:longest])
 		if c.cache != nil {
 			c.cache.CopyPrefix(longestSlot.Id, oldestSlot.Id, longest)
@@ -212,7 +207,7 @@ func (c *InputCache) findBestCacheSlot(prompt []input) (*InputCacheSlot, int32, 
 	return oldestSlot, longest, nil
 }
 
-func countCommonPrefix(a []input, b []input) int32 {
+func countCommonPrefix(a []input.Input, b []input.Input) int32 {
 	var count int32
 
 	for i := range a {
@@ -220,7 +215,7 @@ func countCommonPrefix(a []input, b []input) int32 {
 			break
 		}
 
-		if !reflect.DeepEqual(a[i], b[i]) {
+		if a[i].Token != b[i].Token || a[i].MultimodalHash != b[i].MultimodalHash {
 			break
 		}
 

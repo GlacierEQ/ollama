@@ -2,6 +2,7 @@ package ollama
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,13 +17,35 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ollama/ollama/server/internal/cache/blob"
-	"github.com/ollama/ollama/server/internal/chunks"
-	"github.com/ollama/ollama/server/internal/internal/testutil"
+	"github.com/ollama/ollama/server/internal/testutil"
 )
+
+func ExampleRegistry_cancelOnFirstError() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ctx = WithTrace(ctx, &Trace{
+		Update: func(l *Layer, n int64, err error) {
+			if err != nil {
+				// Discontinue pulling layers if there is an
+				// error instead of continuing to pull more
+				// data.
+				cancel()
+			}
+		},
+	})
+
+	var r Registry
+	if err := r.Pull(ctx, "model"); err != nil {
+		// panic for demo purposes
+		panic(err)
+	}
+}
 
 func TestManifestMarshalJSON(t *testing.T) {
 	// All manifests should contain an "empty" config object.
@@ -34,20 +57,6 @@ func TestManifestMarshalJSON(t *testing.T) {
 	if !bytes.Contains(data, []byte(`"config":{"digest":"sha256:`)) {
 		t.Error("expected manifest to contain empty config")
 		t.Fatalf("got:\n%s", string(data))
-	}
-}
-
-func link(c *blob.DiskCache, name string, manifest string) {
-	_, n, _, err := parseName(name)
-	if err != nil {
-		panic(err)
-	}
-	d, err := c.Import(bytes.NewReader([]byte(manifest)), int64(len(manifest)))
-	if err != nil {
-		panic(err)
-	}
-	if err := c.Link(n.String(), d); err != nil {
-		panic(err)
 	}
 }
 
@@ -70,22 +79,23 @@ func (rr recordRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 
 // newClient constructs a cache with predefined manifests for testing. The manifests are:
 //
-//	empty: no data
-//	zero: no layers
-//	single: one layer with the contents "exists"
-//	multiple: two layers with the contents "exists" and "here"
-//	notfound: a layer that does not exist in the cache
-//	null: one null layer (e.g. [null])
-//	sizemismatch: one valid layer, and one with a size mismatch (file size is less than the reported size)
-//	invalid: a layer with invalid JSON data
+//	empty:         no data
+//	zero:          no layers
+//	single:        one layer with the contents "exists"
+//	multiple:      two layers with the contents "exists" and "here"
+//	notfound:      a layer that does not exist in the cache
+//	null:          one null layer (e.g. [null])
+//	sizemismatch:  one valid layer, and one with a size mismatch (file size is less than the reported size)
+//	invalid:       a layer with invalid JSON data
 //
 // Tests that want to ensure the client does not communicate with the upstream
 // registry should pass a nil handler, which will cause a panic if
 // communication is attempted.
 //
 // To simulate a network error, pass a handler that returns a 499 status code.
-func newClient(t *testing.T, h http.HandlerFunc) (*Registry, *blob.DiskCache) {
+func newClient(t *testing.T, upstreamRegistry http.HandlerFunc) (*Registry, *blob.DiskCache) {
 	t.Helper()
+
 	c, err := blob.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -98,30 +108,46 @@ func newClient(t *testing.T, h http.HandlerFunc) (*Registry, *blob.DiskCache) {
 		}
 	}
 
+	r := &Registry{
+		Cache: c,
+		HTTPClient: &http.Client{
+			Transport: recordRoundTripper(upstreamRegistry),
+		},
+	}
+
+	link := func(name string, manifest string) {
+		n, err := r.parseName(name)
+		if err != nil {
+			panic(err)
+		}
+		d, err := c.Import(bytes.NewReader([]byte(manifest)), int64(len(manifest)))
+		if err != nil {
+			panic(err)
+		}
+		if err := c.Link(n.String(), d); err != nil {
+			panic(err)
+		}
+	}
+
 	commit := func(name string, layers ...*Layer) {
 		t.Helper()
 		data, err := json.Marshal(&Manifest{Layers: layers})
 		if err != nil {
 			t.Fatal(err)
 		}
-		link(c, name, string(data))
+		link(name, string(data))
 	}
 
-	link(c, "empty", "")
+	link("empty", "")
 	commit("zero")
 	commit("single", mklayer("exists"))
 	commit("multiple", mklayer("exists"), mklayer("present"))
 	commit("notfound", &Layer{Digest: blob.DigestFromBytes("notfound"), Size: int64(len("notfound"))})
 	commit("null", nil)
 	commit("sizemismatch", mklayer("exists"), &Layer{Digest: blob.DigestFromBytes("present"), Size: 499})
-	link(c, "invalid", "!!!!!")
+	link("invalid", "!!!!!")
 
-	rc := &Registry{
-		HTTPClient: &http.Client{
-			Transport: recordRoundTripper(h),
-		},
-	}
-	return rc, c
+	return r, c
 }
 
 func okHandler(w http.ResponseWriter, r *http.Request) {
@@ -144,84 +170,61 @@ func importBytes(t *testing.T, c *blob.DiskCache, data string) blob.Digest {
 	return d
 }
 
-func TestRegistryPushInvalidNames(t *testing.T) {
-	rc, c := newClient(t, nil)
-
-	cases := []struct {
-		name string
-		err  error
-	}{
-		{"", ErrNameInvalid},
-		{"@", ErrNameInvalid},
-		{"@x", blob.ErrInvalidDigest},
-	}
-
-	for _, tt := range cases {
-		t.Run(tt.name, func(t *testing.T) {
-			// Create a new registry and push a new image.
-			err := rc.Push(t.Context(), c, tt.name, nil)
-			if !errors.Is(err, tt.err) {
-				t.Errorf("err = %v; want %v", err, tt.err)
-			}
-		})
-	}
-}
-
 func withTraceUnexpected(ctx context.Context) (context.Context, *Trace) {
 	t := &Trace{Update: func(*Layer, int64, error) { panic("unexpected") }}
 	return WithTrace(ctx, t), t
 }
 
 func TestPushZero(t *testing.T) {
-	rc, c := newClient(t, okHandler)
-	err := rc.Push(t.Context(), c, "empty", nil)
+	rc, _ := newClient(t, okHandler)
+	err := rc.Push(t.Context(), "empty", nil)
 	if !errors.Is(err, ErrManifestInvalid) {
 		t.Errorf("err = %v; want %v", err, ErrManifestInvalid)
 	}
 }
 
 func TestPushSingle(t *testing.T) {
-	rc, c := newClient(t, okHandler)
-	err := rc.Push(t.Context(), c, "single", nil)
+	rc, _ := newClient(t, okHandler)
+	err := rc.Push(t.Context(), "single", nil)
 	testutil.Check(t, err)
 }
 
 func TestPushMultiple(t *testing.T) {
-	rc, c := newClient(t, okHandler)
-	err := rc.Push(t.Context(), c, "multiple", nil)
+	rc, _ := newClient(t, okHandler)
+	err := rc.Push(t.Context(), "multiple", nil)
 	testutil.Check(t, err)
 }
 
 func TestPushNotFound(t *testing.T) {
-	rc, c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+	rc, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected request: %v", r)
 	})
-	err := rc.Push(t.Context(), c, "notfound", nil)
+	err := rc.Push(t.Context(), "notfound", nil)
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("err = %v; want %v", err, fs.ErrNotExist)
 	}
 }
 
 func TestPushNullLayer(t *testing.T) {
-	rc, c := newClient(t, nil)
-	err := rc.Push(t.Context(), c, "null", nil)
+	rc, _ := newClient(t, nil)
+	err := rc.Push(t.Context(), "null", nil)
 	if err == nil || !strings.Contains(err.Error(), "invalid manifest") {
 		t.Errorf("err = %v; want invalid manifest", err)
 	}
 }
 
 func TestPushSizeMismatch(t *testing.T) {
-	rc, c := newClient(t, nil)
+	rc, _ := newClient(t, nil)
 	ctx, _ := withTraceUnexpected(t.Context())
-	got := rc.Push(ctx, c, "sizemismatch", nil)
+	got := rc.Push(ctx, "sizemismatch", nil)
 	if got == nil || !strings.Contains(got.Error(), "size mismatch") {
 		t.Errorf("err = %v; want size mismatch", got)
 	}
 }
 
 func TestPushInvalid(t *testing.T) {
-	rc, c := newClient(t, nil)
-	err := rc.Push(t.Context(), c, "invalid", nil)
+	rc, _ := newClient(t, nil)
+	err := rc.Push(t.Context(), "invalid", nil)
 	if err == nil || !strings.Contains(err.Error(), "invalid manifest") {
 		t.Errorf("err = %v; want invalid manifest", err)
 	}
@@ -229,7 +232,7 @@ func TestPushInvalid(t *testing.T) {
 
 func TestPushExistsAtRemote(t *testing.T) {
 	var pushed bool
-	rc, c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+	rc, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/uploads/") {
 			if !pushed {
 				// First push. Return an uploadURL.
@@ -257,35 +260,35 @@ func TestPushExistsAtRemote(t *testing.T) {
 
 	check := testutil.Checker(t)
 
-	err := rc.Push(ctx, c, "single", nil)
+	err := rc.Push(ctx, "single", nil)
 	check(err)
 
 	if !errors.Is(errors.Join(errs...), nil) {
 		t.Errorf("errs = %v; want %v", errs, []error{ErrCached})
 	}
 
-	err = rc.Push(ctx, c, "single", nil)
+	err = rc.Push(ctx, "single", nil)
 	check(err)
 }
 
 func TestPushRemoteError(t *testing.T) {
-	rc, c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+	rc, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/blobs/") {
 			w.WriteHeader(500)
 			io.WriteString(w, `{"errors":[{"code":"blob_error"}]}`)
 			return
 		}
 	})
-	got := rc.Push(t.Context(), c, "single", nil)
+	got := rc.Push(t.Context(), "single", nil)
 	checkErrCode(t, got, 500, "blob_error")
 }
 
 func TestPushLocationError(t *testing.T) {
-	rc, c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+	rc, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", ":///x")
 		w.WriteHeader(http.StatusAccepted)
 	})
-	got := rc.Push(t.Context(), c, "single", nil)
+	got := rc.Push(t.Context(), "single", nil)
 	wantContains := "invalid upload URL"
 	if got == nil || !strings.Contains(got.Error(), wantContains) {
 		t.Errorf("err = %v; want to contain %v", got, wantContains)
@@ -293,14 +296,14 @@ func TestPushLocationError(t *testing.T) {
 }
 
 func TestPushUploadRoundtripError(t *testing.T) {
-	rc, c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+	rc, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Host == "blob.store" {
 			w.WriteHeader(499) // force RoundTrip error on upload
 			return
 		}
 		w.Header().Set("Location", "http://blob.store/blobs/123")
 	})
-	got := rc.Push(t.Context(), c, "single", nil)
+	got := rc.Push(t.Context(), "single", nil)
 	if !errors.Is(got, errRoundTrip) {
 		t.Errorf("got = %v; want %v", got, errRoundTrip)
 	}
@@ -316,20 +319,20 @@ func TestPushUploadFileOpenError(t *testing.T) {
 			os.Remove(c.GetFile(l.Digest))
 		},
 	})
-	got := rc.Push(ctx, c, "single", nil)
+	got := rc.Push(ctx, "single", nil)
 	if !errors.Is(got, fs.ErrNotExist) {
 		t.Errorf("got = %v; want fs.ErrNotExist", got)
 	}
 }
 
 func TestPushCommitRoundtripError(t *testing.T) {
-	rc, c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+	rc, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/blobs/") {
 			panic("unexpected")
 		}
 		w.WriteHeader(499) // force RoundTrip error
 	})
-	err := rc.Push(t.Context(), c, "zero", nil)
+	err := rc.Push(t.Context(), "zero", nil)
 	if !errors.Is(err, errRoundTrip) {
 		t.Errorf("err = %v; want %v", err, errRoundTrip)
 	}
@@ -343,8 +346,8 @@ func checkNotExist(t *testing.T, err error) {
 }
 
 func TestRegistryPullInvalidName(t *testing.T) {
-	rc, c := newClient(t, nil)
-	err := rc.Pull(t.Context(), c, "://")
+	rc, _ := newClient(t, nil)
+	err := rc.Pull(t.Context(), "://")
 	if !errors.Is(err, ErrNameInvalid) {
 		t.Errorf("err = %v; want %v", err, ErrNameInvalid)
 	}
@@ -359,10 +362,10 @@ func TestRegistryPullInvalidManifest(t *testing.T) {
 	}
 
 	for _, resp := range cases {
-		rc, c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		rc, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 			io.WriteString(w, resp)
 		})
-		err := rc.Pull(t.Context(), c, "x")
+		err := rc.Pull(t.Context(), "x")
 		if !errors.Is(err, ErrManifestInvalid) {
 			t.Errorf("err = %v; want invalid manifest", err)
 		}
@@ -385,18 +388,18 @@ func TestRegistryPullNotCached(t *testing.T) {
 	})
 
 	// Confirm that the layer does not exist locally
-	_, err := ResolveLocal(c, "model")
+	_, err := rc.ResolveLocal("model")
 	checkNotExist(t, err)
 
 	_, err = c.Get(d)
 	checkNotExist(t, err)
 
-	err = rc.Pull(t.Context(), c, "model")
+	err = rc.Pull(t.Context(), "model")
 	check(err)
 
 	mw, err := rc.Resolve(t.Context(), "model")
 	check(err)
-	mg, err := ResolveLocal(c, "model")
+	mg, err := rc.ResolveLocal("model")
 	check(err)
 	if !reflect.DeepEqual(mw, mg) {
 		t.Errorf("mw = %v; mg = %v", mw, mg)
@@ -421,7 +424,7 @@ func TestRegistryPullNotCached(t *testing.T) {
 
 func TestRegistryPullCached(t *testing.T) {
 	cached := blob.DigestFromBytes("exists")
-	rc, c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+	rc, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/blobs/") {
 			w.WriteHeader(499) // should not be called
 			return
@@ -444,10 +447,10 @@ func TestRegistryPullCached(t *testing.T) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	err := rc.Pull(ctx, c, "single")
+	err := rc.Pull(ctx, "single")
 	testutil.Check(t, err)
 
-	want := []int64{6}
+	want := []int64{0, 6}
 	if !errors.Is(errors.Join(errs...), ErrCached) {
 		t.Errorf("errs = %v; want %v", errs, ErrCached)
 	}
@@ -457,30 +460,30 @@ func TestRegistryPullCached(t *testing.T) {
 }
 
 func TestRegistryPullManifestNotFound(t *testing.T) {
-	rc, c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+	rc, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	})
-	err := rc.Pull(t.Context(), c, "notfound")
+	err := rc.Pull(t.Context(), "notfound")
 	checkErrCode(t, err, 404, "")
 }
 
 func TestRegistryPullResolveRemoteError(t *testing.T) {
-	rc, c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+	rc, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		io.WriteString(w, `{"errors":[{"code":"an_error"}]}`)
 	})
-	err := rc.Pull(t.Context(), c, "single")
+	err := rc.Pull(t.Context(), "single")
 	checkErrCode(t, err, 500, "an_error")
 }
 
 func TestRegistryPullResolveRoundtripError(t *testing.T) {
-	rc, c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+	rc, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/manifests/") {
 			w.WriteHeader(499) // force RoundTrip error
 			return
 		}
 	})
-	err := rc.Pull(t.Context(), c, "single")
+	err := rc.Pull(t.Context(), "single")
 	if !errors.Is(err, errRoundTrip) {
 		t.Errorf("err = %v; want %v", err, errRoundTrip)
 	}
@@ -533,7 +536,7 @@ func TestRegistryPullMixedCachedNotCached(t *testing.T) {
 
 		// Check that we pull all layers that we can.
 
-		err := rc.Pull(ctx, c, "mixed")
+		err := rc.Pull(ctx, "mixed")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -547,54 +550,6 @@ func TestRegistryPullMixedCachedNotCached(t *testing.T) {
 				t.Errorf("info.Size = %v; want %v", info.Size, 6)
 			}
 		}
-	}
-}
-
-func TestRegistryPullChunking(t *testing.T) {
-	rc, c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
-		t.Log("request:", r.URL.Host, r.Method, r.URL.Path, r.Header.Get("Range"))
-		if r.URL.Host != "blob.store" {
-			// The production registry redirects to the blob store.
-			http.Redirect(w, r, "http://blob.store"+r.URL.Path, http.StatusFound)
-			return
-		}
-		if strings.Contains(r.URL.Path, "/blobs/") {
-			rng := r.Header.Get("Range")
-			if rng == "" {
-				http.Error(w, "missing range", http.StatusBadRequest)
-				return
-			}
-			_, c, err := chunks.ParseRange(r.Header.Get("Range"))
-			if err != nil {
-				panic(err)
-			}
-			io.WriteString(w, "remote"[c.Start:c.End+1])
-			return
-		}
-		fmt.Fprintf(w, `{"layers":[{"digest":%q,"size":6}]}`, blob.DigestFromBytes("remote"))
-	})
-
-	// Force chunking by setting the threshold to less than the size of the
-	// layer.
-	rc.ChunkingThreshold = 3
-	rc.MaxChunkSize = 3
-
-	var reads []int64
-	ctx := WithTrace(t.Context(), &Trace{
-		Update: func(d *Layer, n int64, err error) {
-			if err != nil {
-				t.Errorf("update %v %d %v", d, n, err)
-			}
-			reads = append(reads, n)
-		},
-	})
-
-	err := rc.Pull(ctx, c, "remote")
-	testutil.Check(t, err)
-
-	want := []int64{0, 3, 6}
-	if !slices.Equal(reads, want) {
-		t.Errorf("reads = %v; want %v", reads, want)
 	}
 }
 
@@ -621,13 +576,13 @@ func TestInsecureSkipVerify(t *testing.T) {
 	}))
 	defer s.Close()
 
-	const name = "ollama.com/library/insecure"
+	const name = "library/insecure"
 
 	var rc Registry
 	url := fmt.Sprintf("https://%s/%s", s.Listener.Addr(), name)
 	_, err := rc.Resolve(t.Context(), url)
 	if err == nil || !strings.Contains(err.Error(), "failed to verify") {
-		t.Errorf("err = %v; want cert verifiction failure", err)
+		t.Errorf("err = %v; want cert verification failure", err)
 	}
 
 	url = fmt.Sprintf("https+insecure://%s/%s", s.Listener.Addr(), name)
@@ -652,5 +607,262 @@ func TestCanRetry(t *testing.T) {
 		if got := canRetry(tt.err); got != tt.want {
 			t.Errorf("CanRetry(%v) = %v; want %v", tt.err, got, tt.want)
 		}
+	}
+}
+
+func TestErrorUnmarshal(t *testing.T) {
+	cases := []struct {
+		name    string
+		data    string
+		want    *Error
+		wantErr bool
+	}{
+		{
+			name:    "errors empty",
+			data:    `{"errors":[]}`,
+			wantErr: true,
+		},
+		{
+			name:    "errors empty",
+			data:    `{"errors":[]}`,
+			wantErr: true,
+		},
+		{
+			name: "errors single",
+			data: `{"errors":[{"code":"blob_unknown"}]}`,
+			want: &Error{Code: "blob_unknown", Message: ""},
+		},
+		{
+			name: "errors multiple",
+			data: `{"errors":[{"code":"blob_unknown"},{"code":"blob_error"}]}`,
+			want: &Error{Code: "blob_unknown", Message: ""},
+		},
+		{
+			name:    "error empty",
+			data:    `{"error":""}`,
+			wantErr: true,
+		},
+		{
+			name:    "error very empty",
+			data:    `{}`,
+			wantErr: true,
+		},
+		{
+			name: "error message",
+			data: `{"error":"message", "code":"code"}`,
+			want: &Error{Code: "code", Message: "message"},
+		},
+		{
+			name:    "invalid value",
+			data:    `{"error": 1}`,
+			wantErr: true,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			var got Error
+			err := json.Unmarshal([]byte(tt.data), &got)
+			if err != nil {
+				if tt.wantErr {
+					return
+				}
+				t.Errorf("Unmarshal() error = %v", err)
+				// fallthrough and check got
+			}
+			if tt.want == nil {
+				tt.want = &Error{}
+			}
+			if !reflect.DeepEqual(got, *tt.want) {
+				t.Errorf("got = %v; want %v", got, *tt.want)
+			}
+		})
+	}
+}
+
+// TestParseNameErrors tests that parseName returns errors messages with enough
+// detail for users to debug naming issues they may encounter. Previous to this
+// test, the error messages were not very helpful and each problem was reported
+// as the same message.
+//
+// It is only for testing error messages, not that all invalids and valids are
+// covered. Those are in other tests for names.Name and blob.Digest.
+func TestParseNameExtendedErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{}
+
+	var r Registry
+	for _, tt := range cases {
+		_, _, _, err := r.parseNameExtended(tt.name)
+		if !errors.Is(err, tt.err) {
+			t.Errorf("[%s]: err = %v; want %v", tt.name, err, tt.err)
+		}
+		if err != nil && !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("[%s]: err =\n\t%v\nwant\n\t%v", tt.name, err, tt.want)
+		}
+	}
+}
+
+func TestParseNameExtended(t *testing.T) {
+	cases := []struct {
+		in     string
+		scheme string
+		name   string
+		digest string
+		err    string
+	}{
+		{in: "http://m", scheme: "http", name: "m"},
+		{in: "https+insecure://m", scheme: "https+insecure", name: "m"},
+		{in: "http+insecure://m", err: "unsupported scheme"},
+
+		{in: "http://m@sha256:1111111111111111111111111111111111111111111111111111111111111111", scheme: "http", name: "m", digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+
+		{in: "", err: "invalid or missing name"},
+		{in: "m", scheme: "https", name: "m"},
+		{in: "://", err: "invalid or missing name"},
+		{in: "@sha256:deadbeef", err: "invalid digest"},
+		{in: "@sha256:deadbeef@sha256:deadbeef", err: "invalid digest"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.in, func(t *testing.T) {
+			var r Registry
+			scheme, n, digest, err := r.parseNameExtended(tt.in)
+			if err != nil {
+				if tt.err == "" {
+					t.Errorf("err = %v; want nil", err)
+				} else if !strings.Contains(err.Error(), tt.err) {
+					t.Errorf("err = %v; want %q", err, tt.err)
+				}
+			} else if tt.err != "" {
+				t.Errorf("err = nil; want %q", tt.err)
+			}
+			if err == nil && !n.IsFullyQualified() {
+				t.Errorf("name = %q; want fully qualified", n)
+			}
+
+			if scheme != tt.scheme {
+				t.Errorf("scheme = %q; want %q", scheme, tt.scheme)
+			}
+
+			// smoke-test name is superset of tt.name
+			if !strings.Contains(n.String(), tt.name) {
+				t.Errorf("name = %q; want %q", n, tt.name)
+			}
+
+			tt.digest = cmp.Or(tt.digest, (&blob.Digest{}).String())
+			if digest.String() != tt.digest {
+				t.Errorf("digest = %q; want %q", digest, tt.digest)
+			}
+		})
+	}
+}
+
+func TestUnlink(t *testing.T) {
+	t.Run("found by name", func(t *testing.T) {
+		rc, _ := newClient(t, nil)
+
+		// confirm linked
+		_, err := rc.ResolveLocal("single")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+
+		// unlink
+		_, err = rc.Unlink("single")
+		testutil.Check(t, err)
+
+		// confirm unlinked
+		_, err = rc.ResolveLocal("single")
+		if !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("err = %v; want fs.ErrNotExist", err)
+		}
+	})
+	t.Run("not found by name", func(t *testing.T) {
+		rc, _ := newClient(t, nil)
+		ok, err := rc.Unlink("manifestNotFound")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			t.Error("expected not found")
+		}
+	})
+}
+
+func TestPullChunksums(t *testing.T) {
+	check := testutil.Checker(t)
+
+	content := "hello"
+	var chunksums string
+	contentDigest := func() blob.Digest {
+		return blob.DigestFromBytes(content)
+	}
+	rc, c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/manifests/latest"):
+			fmt.Fprintf(w, `{"layers":[{"digest":%q,"size":%d}]}`, contentDigest(), len(content))
+		case strings.HasSuffix(r.URL.Path, "/chunksums/"+contentDigest().String()):
+			loc := fmt.Sprintf("http://blob.store/v2/library/test/blobs/%s", contentDigest())
+			w.Header().Set("Content-Location", loc)
+			io.WriteString(w, chunksums)
+		case strings.Contains(r.URL.Path, "/blobs/"+contentDigest().String()):
+			http.ServeContent(w, r, contentDigest().String(), time.Time{}, strings.NewReader(content))
+		default:
+			t.Errorf("unexpected request: %v", r)
+			http.NotFound(w, r)
+		}
+	})
+
+	rc.MaxStreams = 1        // prevent concurrent chunk downloads
+	rc.ChunkingThreshold = 1 // for all blobs to be chunked
+
+	var mu sync.Mutex
+	var reads []int64
+	ctx := WithTrace(t.Context(), &Trace{
+		Update: func(l *Layer, n int64, err error) {
+			t.Logf("Update: %v %d %v", l, n, err)
+			mu.Lock()
+			reads = append(reads, n)
+			mu.Unlock()
+		},
+	})
+
+	chunksums = fmt.Sprintf("%s 0-2\n%s 3-4\n",
+		blob.DigestFromBytes("hel"),
+		blob.DigestFromBytes("lo"),
+	)
+	err := rc.Pull(ctx, "test")
+	check(err)
+	wantReads := []int64{
+		0, // initial signaling of layer pull starting
+		3, // first chunk read
+		2, // second chunk read
+	}
+	if !slices.Equal(reads, wantReads) {
+		t.Errorf("reads = %v; want %v", reads, wantReads)
+	}
+
+	mw, err := rc.Resolve(t.Context(), "test")
+	check(err)
+	mg, err := rc.ResolveLocal("test")
+	check(err)
+	if !reflect.DeepEqual(mw, mg) {
+		t.Errorf("mw = %v; mg = %v", mw, mg)
+	}
+	for i := range mg.Layers {
+		_, err = c.Get(mg.Layers[i].Digest)
+		if err != nil {
+			t.Errorf("Get(%v): %v", mg.Layers[i].Digest, err)
+		}
+	}
+
+	// missing chunks
+	content = "llama"
+	chunksums = fmt.Sprintf("%s 0-1\n", blob.DigestFromBytes("ll"))
+	err = rc.Pull(ctx, "missingchunks")
+	if err == nil {
+		t.Error("expected error because of missing chunks")
 	}
 }
